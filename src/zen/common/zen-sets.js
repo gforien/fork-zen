@@ -151,6 +151,11 @@ document.addEventListener(
             }
             break;
           }
+          // fork: zen-keybinds start
+          case "cmd_zenDeleteWorkspaceNoConfirm":
+            gZenWorkspaces.removeWorkspace(gZenWorkspaces.activeWorkspace);
+            break;
+          // fork: zen-keybinds end
           default:
             gZenGlanceManager.handleMainCommandSet(event);
             if (event.target.id.startsWith("cmd_zenWorkspaceSwitch")) {

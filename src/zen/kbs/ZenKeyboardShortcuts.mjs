@@ -808,6 +808,20 @@ class nsZenKeyboardShortcutsLoader {
       )
     );
 
+    // fork: zen-keybinds start
+    newShortcutList.push(
+      new KeyShortcut(
+        "zen-workspace-delete-no-confirm",
+        "",
+        "",
+        ZEN_WORKSPACE_SHORTCUTS_GROUP,
+        nsKeyShortcutModifiers.fromObject({}),
+        "cmd_zenDeleteWorkspaceNoConfirm",
+        "zen-workspace-shortcut-delete-no-confirm"
+      )
+    );
+    // fork: zen-keybinds end
+
     return newShortcutList;
   }
 
