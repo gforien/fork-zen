@@ -1,0 +1,591 @@
+# fork: zen-keybinds
+# Rebases `dev` onto the latest release tag from zen-browser/desktop.
+#
+# GitHub Actions cannot subscribe to releases in another repository, so we
+# poll: scheduled hourly, plus manual trigger.
+#
+# Two-job design to avoid wasted work:
+#  1. `preflight` (cheap, ~5s): asks GitHub API for the latest upstream
+#     release tag, then looks up an `actions/cache` entry keyed on that tag.
+#     Cache HIT  -> tag already handled in a previous run, exit immediately.
+#     Cache MISS -> new tag, signal the next job.
+#  2. `rebase`  (expensive, only runs on cache miss): full checkout, fetch
+#     upstream tags, rebase `dev` onto the target tag, force-push, then
+#     write the tag name into the cache so subsequent preflights skip.
+#
+# Effect: when upstream is quiet, hourly runs are ~5s each with no clone
+# and no fetch. Real work only happens when a new tag appears.
+#
+# After a successful rebase, `dev` is force-pushed. Anyone tracking this
+# branch should be aware of the rewritten history.
+name: Sync upstream Zen release
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - .github/workflows/sync-zen.yml
+  schedule:
+    - cron: "0 * * * *" # hourly
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to rebase onto (empty = latest tag)"
+        required: false
+        type: string
+      include_prerelease:
+        description: "Include pre-releases in latest tag"
+        required: false
+        type: boolean
+        default: false
+      force:
+        description: "Force rebase"
+        required: false
+        type: boolean
+        default: false
+      release:
+        description: "Enable releases"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read  # required by preflight summary for the cache metadata API
+
+concurrency:
+  group: sync-zen
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Check for new upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - name: Resolve target tag (no checkout, no fetch)
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INCLUDE_PRERELEASE: ${{ inputs.include_prerelease }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "${INCLUDE_PRERELEASE:-false}" = "true" ]; then
+            # `gh release list` lists pre-releases too; pick the most recently published.
+            TAG=$(gh release list --repo zen-browser/desktop --limit 1 \
+                    --json tagName --jq '.[0].tagName')
+          else
+            # GitHub's "latest" excludes pre-releases.
+            TAG=$(gh release view --repo zen-browser/desktop --json tagName --jq .tagName)
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not resolve a target tag."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: $TAG"
+
+      # Cache key is the tag name. HIT = already processed. MISS = new work.
+      # On hit, .handled-tag is restored to disk so the summary can read the
+      # workflow run that created it (rebase job writes `run_id`/`run_number`
+      # into the file). A real restore also touches the cache's access time,
+      # extending the 7-day eviction window for stable tags.
+      - name: Probe cache for this tag
+        id: probe
+        uses: actions/cache/restore@v4
+        with:
+          path: .handled-tag
+          key: handled-zen-tag-${{ steps.latest.outputs.tag }}
+
+      - name: Decide whether to run the rebase job
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+          HIT: ${{ steps.probe.outputs.cache-hit }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Order of gates:
+          # 1. force flag -> always run (debugging escape hatch)
+          # 2. cache hit -> already handled, skip
+          # 3. release exists on fork -> immutable release gate; skip and
+          #    persist cache so next hourly run short-circuits without
+          #    re-querying the release API
+          # 4. otherwise -> rebase job runs
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "Force flag set, will run rebase regardless of cache."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "status=force" >> "$GITHUB_OUTPUT"
+          elif [ "$HIT" = "true" ]; then
+            echo "Tag $TAG already handled (cache hit). Skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "status=cache_hit" >> "$GITHUB_OUTPUT"
+          elif gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Tag $TAG already released on this fork. Skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "status=already_released" >> "$GITHUB_OUTPUT"
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $TAG is new (cache miss, no release). Will rebase."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "status=cache_miss" >> "$GITHUB_OUTPUT"
+          fi
+
+      # When the gate said "already released" on a cache miss, write the
+      # cache so the next hourly run cache-hits without re-querying the
+      # release API.
+      - name: Mark cache for already-released tag
+        if: steps.decide.outputs.save_cache == 'true'
+        run: |
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_number=${GITHUB_RUN_NUMBER}"
+          } > .handled-tag
+
+      - name: Save cache for already-released tag
+        if: steps.decide.outputs.save_cache == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .handled-tag
+          key: handled-zen-tag-${{ steps.latest.outputs.tag }}
+
+      - name: Summary
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.latest.outputs.tag }}
+          SHOULD_RUN: ${{ steps.decide.outputs.should_run }}
+          STATUS: ${{ steps.decide.outputs.status }}
+          HIT: ${{ steps.probe.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { TAG, SHOULD_RUN, STATUS, HIT, FORCE } = process.env;
+            const UPSTREAM_OWNER = 'zen-browser';
+            const UPSTREAM_REPO  = 'desktop';
+            const UPSTREAM       = `${UPSTREAM_OWNER}/${UPSTREAM_REPO}`;
+            const FORK_OWNER     = context.repo.owner;
+            const FORK_REPO      = context.repo.repo;
+            const FORK           = `${FORK_OWNER}/${FORK_REPO}`;
+            const SERVER         = process.env.GITHUB_SERVER_URL;
+            const CACHE_KEY      = `handled-zen-tag-${TAG}`;
+            const RELEASE_URL    = `${SERVER}/${FORK}/releases/tag/${TAG}`;
+            const short = s => (s || '').slice(0, 7);
+
+            const conclusion =
+              STATUS === 'force'            ? 'force flag set — rebase job will run regardless of cache'
+              : STATUS === 'cache_hit'      ? 'already handled in a previous run, rebase job skipped'
+              : STATUS === 'already_released' ? `already released on this fork as [\`${TAG}\`](${RELEASE_URL}) — rebase job skipped`
+              : STATUS === 'cache_miss'     ? 'cache miss — rebase job will run'
+                                            : 'rebase job will not run';
+
+            // --- Read cache-stored run metadata (only meaningful on HIT) ---
+            const cacheMeta = {};
+            if (HIT === 'true') {
+              try {
+                for (const line of fs.readFileSync('.handled-tag', 'utf8').split('\n')) {
+                  const [k, v] = line.split('=');
+                  if (k && v) cacheMeta[k.trim()] = v.trim();
+                }
+              } catch (e) {
+                core.info(`No .handled-tag file readable: ${e.message}`);
+              }
+            }
+
+            // --- API calls ---
+            // 1. Tag commit SHA (always — we always show the tag).
+            let tagSha = '';
+            try {
+              const { data } = await github.rest.repos.getCommit({
+                owner: UPSTREAM_OWNER, repo: UPSTREAM_REPO, ref: TAG,
+              });
+              tagSha = data.sha;
+            } catch (e) {
+              core.warning(`Could not resolve tag commit for ${TAG}: ${e.message}`);
+            }
+
+            // 2a. Cross-repo compare: fork:dev vs upstream:dev.
+            //     Shows divergence between the fork's working branch and the
+            //     upstream's active branch (more useful than vs the released
+            //     tag, since the fork tracks upstream dev, not tag releases).
+            let forkDevSha = '';
+            let forkAhead = null, forkBehind = null;
+            try {
+              const { data } = await github.rest.repos.compareCommits({
+                owner: FORK_OWNER, repo: FORK_REPO,
+                base: `${UPSTREAM_OWNER}:dev`,
+                head: 'dev',
+              });
+              forkDevSha = data.commits.length ? data.commits.at(-1).sha
+                         : data.merge_base_commit?.sha || '';
+              forkAhead  = data.ahead_by;
+              forkBehind = data.behind_by;
+            } catch (e) {
+              core.warning(`compareCommits fork failed: ${e.message}`);
+            }
+
+            // 2b. Upstream compare: upstream:dev vs upstream:TAG.
+            //     Tells you how far upstream has moved past the released tag.
+            let upstreamDevSha = '';
+            let upstreamAhead = null, upstreamBehind = null;
+            try {
+              const { data } = await github.rest.repos.compareCommits({
+                owner: UPSTREAM_OWNER, repo: UPSTREAM_REPO,
+                base: TAG,
+                head: 'dev',
+              });
+              upstreamDevSha = data.commits.length ? data.commits.at(-1).sha
+                             : data.merge_base_commit?.sha || '';
+              upstreamAhead  = data.ahead_by;
+              upstreamBehind = data.behind_by;
+            } catch (e) {
+              core.warning(`compareCommits upstream failed: ${e.message}`);
+            }
+
+            // 3. Cache metadata (only on HIT).
+            let cacheCreatedAt = null;
+            if (HIT === 'true') {
+              try {
+                const { data } = await github.rest.actions.getActionsCacheList({
+                  owner: FORK_OWNER, repo: FORK_REPO, key: CACHE_KEY,
+                });
+                if (data.actions_caches?.length) {
+                  // Latest matching entry (API may return multiple if ref differs).
+                  cacheCreatedAt = data.actions_caches
+                    .map(c => c.created_at)
+                    .sort()
+                    .at(-1);
+                }
+              } catch (e) {
+                core.warning(`Cache metadata lookup failed: ${e.message}`);
+              }
+            }
+
+            // --- Formatting helpers ---
+            const relativeDate = iso => {
+              if (!iso) return '';
+              const diff = Date.now() - new Date(iso).getTime();
+              const s = 1000, m = 60*s, h = 60*m, d = 24*h, mo = 30*d, y = 365*d;
+              if (diff < m)   return `${Math.floor(diff / s)}s ago`;
+              if (diff < h)   return `${Math.floor(diff / m)}min ago`;
+              if (diff < d)   return `${Math.floor(diff / h)}h ago`;
+              if (diff < mo)  return `${Math.floor(diff / d)}d ago`;
+              if (diff < y)   return `${Math.floor(diff / mo)}mo ago`;
+              return `${Math.floor(diff / y)}y ago`;
+            };
+
+            // --- Build summary lines ---
+            const lines = ['### Preflight status', ''];
+
+            // Helper to format a "<label> dev @ <sha> (N ahead, M behind <subject>)" line.
+            // Only emit the parens if at least one side is non-zero, and within them
+            // only emit the side that is non-zero. `compareSubject` names what the diff
+            // is taken against, so the reader doesn't have to guess.
+            const refLine = ({ label, treeUrl, sha, commitUrlBase, ahead, behind, compareUrl, compareSubject }) => {
+              if (!sha) return `- ${label} [\`dev\`](${treeUrl}) (HEAD unresolved)`;
+              const commitLink = `[\`${short(sha)}\`](${commitUrlBase}/${sha})`;
+              let diffFrag = '';
+              if ((ahead ?? 0) > 0 || (behind ?? 0) > 0) {
+                const parts = [];
+                if ((ahead  ?? 0) > 0) parts.push(`${ahead} ahead`);
+                if ((behind ?? 0) > 0) parts.push(`${behind} behind`);
+                diffFrag = ` ([${parts.join(', ')}](${compareUrl}) ${compareSubject})`;
+              }
+              return `- ${label} [\`dev\`](${treeUrl}) @ ${commitLink}${diffFrag}`;
+            };
+
+            // Line: fork HEAD (compared against upstream HEAD).
+            lines.push(refLine({
+              label: 'fork HEAD',
+              treeUrl: `https://github.com/${FORK}/tree/dev`,
+              sha: forkDevSha,
+              commitUrlBase: `https://github.com/${FORK}/commit`,
+              ahead: forkAhead,
+              behind: forkBehind,
+              compareUrl: `https://github.com/${FORK}/compare/${UPSTREAM_OWNER}:dev...dev`,
+              compareSubject: 'upstream',
+            }));
+
+            // Line: upstream HEAD (compared against latest released tag).
+            lines.push(refLine({
+              label: 'upstream HEAD',
+              treeUrl: `https://github.com/${UPSTREAM}/tree/dev`,
+              sha: upstreamDevSha,
+              commitUrlBase: `https://github.com/${UPSTREAM}/commit`,
+              ahead: upstreamAhead,
+              behind: upstreamBehind,
+              compareUrl: `https://github.com/${UPSTREAM}/compare/${TAG}...dev`,
+              compareSubject: 'latest tag',
+            }));
+
+            // Line: upstream latest tag TAG @ SHA
+            const tagReleaseUrl = `https://github.com/${UPSTREAM}/releases/tag/${TAG}`;
+            if (tagSha) {
+              const tagCommitUrl = `https://github.com/${UPSTREAM}/commit/${tagSha}`;
+              lines.push(`- upstream latest tag [\`${TAG}\`](${tagReleaseUrl}) @ [\`${short(tagSha)}\`](${tagCommitUrl})`);
+            } else {
+              lines.push(`- upstream latest tag [\`${TAG}\`](${tagReleaseUrl}) (commit unresolved)`);
+            }
+
+            // Line: cache key (only when HIT — cache exists)
+            if (HIT === 'true') {
+              const cacheApiUrl = `https://api.github.com/repos/${FORK}/actions/caches?key=${encodeURIComponent(CACHE_KEY)}`;
+              let dateFragment = cacheCreatedAt ? ` set ${relativeDate(cacheCreatedAt)}` : '';
+              let runFragment = '';
+              if (cacheMeta.run_id && cacheMeta.run_number) {
+                const runUrl = `${SERVER}/${FORK}/actions/runs/${cacheMeta.run_id}`;
+                runFragment = ` by [#${cacheMeta.run_number}](${runUrl})`;
+              } else if (cacheMeta.run_id) {
+                const runUrl = `${SERVER}/${FORK}/actions/runs/${cacheMeta.run_id}`;
+                runFragment = ` by [#${cacheMeta.run_id}](${runUrl})`;
+              }
+              lines.push(`- cache key [\`${CACHE_KEY}\`](${cacheApiUrl})${dateFragment}${runFragment}`);
+            }
+
+            // Line: conclusion
+            lines.push(`- conclusion: ${conclusion}`);
+
+            await core.summary.addRaw(lines.join('\n') + '\n').write();
+
+  rebase:
+    name: Rebase dev onto ${{ needs.preflight.outputs.tag }}
+    needs: preflight
+    if: needs.preflight.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev with full history
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Add upstream remote and fetch the target tag
+        id: fetch
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zen-browser/desktop.git
+          # Single-tag fetch (much smaller than --tags) into a private ref
+          # namespace `refs/upstream-tags/*`. We cannot reuse `refs/tags/*`
+          # because the fork creates its own tag with the same name when
+          # releases are enabled (pointing at the rebased HEAD, not the
+          # upstream commit), and `git fetch` rejects the upstream tag with
+          # "would clobber existing tag". Subsequent git operations in this
+          # job use TAG_SHA (resolved here) rather than the tag name, so the
+          # namespace prefix never leaks beyond this step.
+          git fetch upstream --no-recurse-submodules "refs/tags/${TAG}:refs/upstream-tags/${TAG}"
+          TAG_SHA=$(git rev-parse "refs/upstream-tags/${TAG}")
+          HEAD_BEFORE=$(git rev-parse HEAD)
+          echo "tag_sha=${TAG_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_before=${HEAD_BEFORE}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already up to date
+        id: check
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_SHA: ${{ steps.fetch.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor "$TAG_SHA" HEAD; then
+            echo "dev already contains $TAG (no commits to rebase)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git identity
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Rebase dev onto target tag
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_SHA: ${{ steps.fetch.outputs.tag_sha }}
+        run: |
+          set -e
+          if ! git rebase "$TAG_SHA"; then
+            echo "::error::Rebase onto $TAG produced conflicts. Resolve locally and push manually."
+            git rebase --abort || true
+            exit 1
+          fi
+
+      - name: Force-push rebased dev
+        if: steps.check.outputs.skip != 'true'
+        id: push
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin dev
+          echo "head_after=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Always seed the cache on success so the next hourly run short-circuits.
+      # (Including when skip=true: that means we'd already rebased this tag in
+      # a prior run, perhaps before the cache was introduced, so still record it.)
+      # Content stores the originating run so the preflight summary can show
+      # "set N days ago #X".
+      - name: Mark tag as handled
+        run: |
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_number=${GITHUB_RUN_NUMBER}"
+          } > .handled-tag
+
+      - name: Save cache for this tag
+        uses: actions/cache/save@v4
+        with:
+          path: .handled-tag
+          key: handled-zen-tag-${{ needs.preflight.outputs.tag }}
+
+      # Cut the downstream release. `gh release create` also creates the git tag and
+      # pushes it. The preflight release-exists gate ensures we never reach here
+      # for an already- released tag, so no --force / no overwrite needed.
+      #
+      #
+      # Gated on a workflow input variable `inputs.release` (boolean,
+      # default true for workflow_dispatch). On scheduled/push triggers
+      # the input is unset; coalesce to true so cron runs also release.
+      - name: Create downstream release
+        if: (inputs.release == null || inputs.release == true)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_SHA: ${{ steps.fetch.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+          # Idempotency: in steady-state operation the preflight release-exists
+          # gate guarantees we never reach here for an already-released tag,
+          # but `force=true` bypasses that gate. Skip cleanly instead of
+          # erroring on "release already exists".
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists on this fork. Skipping."
+            exit 0
+          fi
+          UPSTREAM_RELEASE="https://github.com/zen-browser/desktop/releases/tag/${TAG}"
+          UPSTREAM_COMMIT="https://github.com/zen-browser/desktop/commit/${TAG_SHA}"
+          NOTES=$(cat <<EOF
+          Downstream fork tracking upstream tag [\`${TAG}\`](${UPSTREAM_RELEASE}) (commit [\`${TAG_SHA:0:7}\`](${UPSTREAM_COMMIT})) with this fork's patches rebased on top.
+
+          See the compare view for the exact fork-only patches: https://github.com/${GITHUB_REPOSITORY}/compare/${TAG}...dev
+          EOF
+          )
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target dev \
+            --title "${TAG}" \
+            --notes "${NOTES}"
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TAG_SHA: ${{ steps.fetch.outputs.tag_sha }}
+          HEAD_BEFORE: ${{ steps.fetch.outputs.head_before }}
+          HEAD_AFTER: ${{ steps.push.outputs.head_after }}
+          SKIP: ${{ steps.check.outputs.skip }}
+        run: |
+          set -u
+          UPSTREAM="zen-browser/desktop"
+          FORK="${GITHUB_REPOSITORY}"
+          SERVER="${GITHUB_SERVER_URL}"
+          RUN_URL="${SERVER}/${FORK}/actions/runs/${GITHUB_RUN_ID}"
+          CACHE_KEY="handled-zen-tag-${TAG}"
+          CACHE_API_URL="https://api.github.com/repos/${FORK}/actions/caches?key=${CACHE_KEY}"
+
+          # If we didn't rebase (skip=true), HEAD_AFTER stays empty; HEAD_BEFORE is current dev.
+          HEAD_NOW="${HEAD_AFTER:-${HEAD_BEFORE:-}}"
+          HEAD_NOW_SHORT="${HEAD_NOW:0:7}"
+          HEAD_BEFORE_SHORT="${HEAD_BEFORE:0:7}"
+          HEAD_AFTER_SHORT="${HEAD_AFTER:0:7}"
+          TAG_SHORT="${TAG_SHA:0:7}"
+
+          # Compute commit count + compact "N files / +X / -Y" diff stat
+          # for inclusion in the fork HEAD line's parens. Use TAG_SHA rather
+          # than the tag name (the tag lives in `refs/upstream-tags/*` in
+          # this runner, not `refs/tags/*`).
+          COUNT=0
+          STAT_INLINE=""
+          if [ -n "${TAG_SHA:-}" ] && git cat-file -e "${TAG_SHA}" 2>/dev/null; then
+            COUNT=$(git rev-list --count "${TAG_SHA}..HEAD" 2>/dev/null || echo 0)
+            RAW_STAT=$(git diff --shortstat "${TAG_SHA}..HEAD" 2>/dev/null || true)
+            if [ -n "${RAW_STAT}" ]; then
+              F=$(echo "${RAW_STAT}" | sed -nE 's/.*[ ]+([0-9]+) files? changed.*/\1/p')
+              I=$(echo "${RAW_STAT}" | sed -nE 's/.*[, ]([0-9]+) insertion.*/\1/p')
+              D=$(echo "${RAW_STAT}" | sed -nE 's/.*[, ]([0-9]+) deletion.*/\1/p')
+              [ -n "${F}" ] && STAT_INLINE="${F} files"
+              [ -n "${I}" ] && STAT_INLINE="${STAT_INLINE}${STAT_INLINE:+ / }+${I}"
+              [ -n "${D}" ] && STAT_INLINE="${STAT_INLINE}${STAT_INLINE:+ / }-${D}"
+            fi
+          fi
+
+          {
+            echo "### Rebase status"
+            echo
+
+            # fork HEAD line
+            if [ -n "${HEAD_NOW}" ]; then
+              FORK_TREE="https://github.com/${FORK}/tree/dev"
+              FORK_COMMIT="https://github.com/${FORK}/commit/${HEAD_NOW}"
+              if [ "${COUNT}" -gt 0 ]; then
+                COMPARE_URL="https://github.com/${FORK}/compare/${TAG}...dev"
+                EXTRA=""
+                [ -n "${STAT_INLINE}" ] && EXTRA=", ${STAT_INLINE}"
+                echo "- fork HEAD [\`dev\`](${FORK_TREE}) @ [\`${HEAD_NOW_SHORT}\`](${FORK_COMMIT}) ([${COUNT} ahead](${COMPARE_URL}) upstream:tag${EXTRA})"
+              else
+                echo "- fork HEAD [\`dev\`](${FORK_TREE}) @ [\`${HEAD_NOW_SHORT}\`](${FORK_COMMIT})"
+              fi
+            else
+              echo "- fork HEAD [\`dev\`](https://github.com/${FORK}/tree/dev) (HEAD unresolved)"
+            fi
+
+            # previous HEAD line (only when an actual rebase rewrote HEAD)
+            if [ -n "${HEAD_AFTER}" ] && [ "${HEAD_AFTER}" != "${HEAD_BEFORE}" ]; then
+              PUSH_COMPARE="https://github.com/${FORK}/compare/${HEAD_BEFORE}...${HEAD_AFTER}"
+              PREV_COMMIT="https://github.com/${FORK}/commit/${HEAD_BEFORE}"
+              echo "- previous HEAD [\`dev\`](https://github.com/${FORK}/tree/dev) @ [\`${HEAD_BEFORE_SHORT}\`](${PREV_COMMIT}) ([pushed](${PUSH_COMPARE}) from this run)"
+            fi
+
+            # upstream tag line
+            if [ -n "${TAG_SHA:-}" ]; then
+              TAG_RELEASE="https://github.com/${UPSTREAM}/releases/tag/${TAG}"
+              TAG_COMMIT="https://github.com/${UPSTREAM}/commit/${TAG_SHA}"
+              echo "- upstream latest tag [\`${TAG}\`](${TAG_RELEASE}) @ [\`${TAG_SHORT}\`](${TAG_COMMIT})"
+            fi
+
+            # cache key line (always: rebase job just wrote it)
+            echo "- cache key [\`${CACHE_KEY}\`](${CACHE_API_URL}) set just now by [#${GITHUB_RUN_NUMBER}](${RUN_URL})"
+
+            # conclusion line
+            if [ "${SKIP:-}" = "true" ]; then
+              echo "- conclusion: dev already contained the tag — no commits replayed"
+            elif [ -n "${HEAD_AFTER}" ] && [ "${HEAD_AFTER}" != "${HEAD_BEFORE}" ]; then
+              echo "- conclusion: rebased \`${HEAD_BEFORE_SHORT}\` → \`${HEAD_AFTER_SHORT}\` and force-pushed"
+            else
+              echo "- conclusion: rebase did not complete (see job logs)"
+            fi
+
+            # collapsible commit list
+            if [ "${COUNT}" -gt 0 ]; then
+              echo
+              echo "<details><summary>${COUNT} commit(s) on top of <code>${TAG}</code></summary>"
+              echo
+              git log "${TAG_SHA}..HEAD" --no-merges --max-count=10 \
+                --pretty=format:"- [\`%h\`](https://github.com/${FORK}/commit/%H) %s"
+              echo
+              if [ "${COUNT}" -gt 10 ]; then
+                echo "- _… and $((COUNT - 10)) more_"
+              fi
+              echo
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
