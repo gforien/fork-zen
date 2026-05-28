@@ -1,0 +1,57 @@
+[tools]
+# Pin Node 20: surfer's `async-icns` dep calls fs.rmdir({recursive: true}),
+# which Node 22 removed (DEP0147). Node 20 still supports it.
+node = "20"
+# Pin Python 3.12. mach's shipped modules don't support Python 3.14 yet
+# (some scripts hit urllib changes).
+python = "3.12"
+
+[env]
+# Bypass mach's `rustup which rustc` probe (homebrew's rustup proxy mis-dispatches it).
+RUSTC = "{{ env.HOME }}/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc"
+CARGO = "{{ env.HOME }}/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
+
+# Expose Homebrew LLVM's lld; Apple's ld isn't accepted by mach.
+_.path = [
+  "{{ env.HOMEBREW_PREFIX | default(value='/opt/homebrew') }}/opt/llvm/bin",
+  "{{ env.HOME }}/.cargo/bin",
+]
+
+# Silence Mozilla telemetry prompt in non-interactive shells.
+MOZ_NOSPAM = "1"
+
+[tasks]
+# Fetch Firefox source into engine/. Surfer skips work if already downloaded.
+download = { run = "npx surfer download" }
+
+# Restore engine/ to a clean Firefox source tree. Required before re-import
+# because surfer's git patches won't apply on top of an already-patched or
+# build-dirtied tree.
+reset = { run = "npx surfer reset" }
+
+# Overlay Zen's src/ tree and patches onto engine/. Always preceded by reset
+# so it lands on pristine Firefox source: that's what makes it idempotent.
+import = { run = "npm run import", depends = ["reset"] }
+
+# Populate ~/.mozbuild with Mozilla's pinned clang/cbindgen/wasi-sysroot/etc.
+# Skips artifacts already present.
+bootstrap = { run = "npm run bootstrap" }
+
+# Persist brand=release in .surfer/ so subsequent surfer commands pick it up.
+# Idempotent: writes the same value each time.
+brand = { run = "npx surfer set brand release" }
+
+# Incremental Zen build with the release brand (-> Zen.app).
+build = { run = "npx surfer build", depends = ["brand"] }
+
+# Produce a distributable .dmg under engine/obj-*/dist/.
+package = { run = "npm run package" }
+
+# Full pipeline: matches `npm run init && npm run build && npm run package`.
+default = { run = [
+  { task = "download" },
+  { task = "import" },
+  { task = "bootstrap" },
+  { task = "build" },
+  { task = "package" },
+] }
